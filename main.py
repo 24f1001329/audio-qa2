@@ -14,7 +14,6 @@ app.add_middleware(
 
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
 CHAT_URL = "https://aipipe.org/openai/v1/chat/completions"
-WHISPER_URL = "https://aipipe.org/openai/v1/audio/transcriptions"
 
 REQUIRED_KEYS = ["rows", "columns", "mean", "std", "variance", "min", "max", "median", "mode", "range", "allowed_values", "value_range", "correlation"]
 
@@ -22,17 +21,11 @@ class Req(BaseModel):
     audio_id: str
     audio_base64: str
 
-def detect_ext(raw):
+def detect_format(raw):
     if raw[:4] == b"RIFF":
         return "wav"
     if raw[:3] == b"ID3" or (len(raw) > 1 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0):
         return "mp3"
-    if raw[:4] == b"OggS":
-        return "ogg"
-    if raw[:4] == b"fLaC":
-        return "flac"
-    if len(raw) > 8 and raw[4:8] == b"ftyp":
-        return "mp4"
     return "wav"
 
 PARSE_PROMPT = (
@@ -44,7 +37,8 @@ PARSE_PROMPT = (
     "mean, std, variance, min, max, median, mode, range, allowed_values, value_range "
     "(each an object mapping column name to the stated value; empty object if not mentioned), "
     "correlation (array; empty array if not mentioned).\n"
-    "RULES: Column names EXACTLY as in the transcript, in the ORIGINAL script (Korean stays in Hangul like 온도, never translated). "
+    "RULES: Column names EXACTLY as in the transcript, in the ORIGINAL script "
+    "(Korean stays in Hangul like 온도, never translated to English). "
     "Every column mentioned must be in the columns array. Stat object keys use those same names. "
     "Numbers as plain JSON numbers. Include only what the transcript states.\n\n"
     "Transcript:\n"
@@ -52,25 +46,40 @@ PARSE_PROMPT = (
 
 async def handle(req: Req):
     b64 = re.sub(r"^data:audio/[\w.+-]+;base64,", "", req.audio_base64)
-    raw = base64.b64decode(b64)
-    ext = detect_ext(raw)
-    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}"}
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        raw = b""
+    fmt = detect_format(raw)
+    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=120) as client:
-        files = {"file": (f"audio.{ext}", raw, f"audio/{ext}")}
-        form = {"model": "whisper-1"}
-        tr = await client.post(WHISPER_URL, headers=headers, data=form, files=files)
+        # Step 1: transcribe with the audio model
+        t_payload = {
+            "model": "gpt-4o-audio-preview",
+            "temperature": 0,
+            "modalities": ["text"],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
+                    {"type": "text", "text": "Transcribe this audio EXACTLY, word for word, in its original language and script (Korean in Hangul, Japanese in Japanese, etc.). Output only the transcription, nothing else."},
+                ],
+            }],
+        }
+        tr = await client.post(CHAT_URL, json=t_payload, headers=headers)
         try:
-            transcript = tr.json().get("text", "")
+            transcript = tr.json()["choices"][0]["message"]["content"].strip()
         except Exception:
             transcript = ""
 
-        payload = {
+        # Step 2: parse the transcript into the required JSON
+        p_payload = {
             "model": "gpt-4o",
             "temperature": 0,
             "messages": [{"role": "user", "content": PARSE_PROMPT + transcript}],
         }
-        r = await client.post(CHAT_URL, json=payload, headers={**headers, "Content-Type": "application/json"})
+        r = await client.post(CHAT_URL, json=p_payload, headers=headers)
 
     data = r.json()
     try:
