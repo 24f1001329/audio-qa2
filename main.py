@@ -13,7 +13,8 @@ app.add_middleware(
 )
 
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-AIPIPE_URL = "https://aipipe.org/openai/v1/chat/completions"
+CHAT_URL = "https://aipipe.org/openai/v1/chat/completions"
+WHISPER_URL = "https://aipipe.org/openai/v1/audio/transcriptions"
 
 REQUIRED_KEYS = ["rows", "columns", "mean", "std", "variance", "min", "max", "median", "mode", "range", "allowed_values", "value_range", "correlation"]
 
@@ -21,62 +22,56 @@ class Req(BaseModel):
     audio_id: str
     audio_base64: str
 
-PROMPT = (
-    "Listen to this audio very carefully, word by word. It may be spoken in ANY language "
-    "(English, Korean, Japanese, Hindi, Tamil, etc.). It describes a dataset specification: "
-    "number of rows, one or more column names, and per-column statistics or rules. "
-    "Return ONLY a raw JSON object (no markdown, no backticks), with EXACTLY these keys: "
-    "rows (integer), columns (array of column-name strings), "
-    "mean, std, variance, min, max, median, mode, range, "
-    "allowed_values, value_range (each an object mapping column name to the value "
-    "stated in the audio; use an empty object for any not mentioned), "
-    "correlation (array; empty array if not mentioned). "
-    "CRITICAL RULES: "
-    "1) Column names must be written EXACTLY as spoken, in the ORIGINAL language and script of the audio. "
-    "If the audio is Korean, write column names in Hangul (e.g. 온도). If Japanese, in Japanese script. Never translate to English. "
-    "2) The columns array must NEVER be empty - the audio always names at least one column. Listen again if needed. "
-    "3) The keys inside mean, std, min, max and the other stat objects must be those same original-script column names. "
-    "4) Numbers must be plain JSON numbers exactly as spoken. "
-    "5) Include only what the audio states."
-)
-
-def detect_format(b64):
-    try:
-        head = base64.b64decode(b64[:64] + "==")
-    except Exception:
+def detect_ext(raw):
+    if raw[:4] == b"RIFF":
         return "wav"
-    if head[:4] == b"RIFF":
-        return "wav"
-    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+    if raw[:3] == b"ID3" or (len(raw) > 1 and raw[0] == 0xFF and (raw[1] & 0xE0) == 0xE0):
         return "mp3"
-    if head[:4] == b"OggS":
+    if raw[:4] == b"OggS":
         return "ogg"
-    if head[:4] == b"fLaC":
+    if raw[:4] == b"fLaC":
         return "flac"
-    if len(head) > 8 and head[4:8] == b"ftyp":
+    if len(raw) > 8 and raw[4:8] == b"ftyp":
         return "mp4"
     return "wav"
 
+PARSE_PROMPT = (
+    "Below is a transcript of an audio (it may be Korean, Japanese, English, or any language). "
+    "It describes a dataset specification: number of rows, one or more column names, "
+    "and per-column statistics or rules.\n"
+    "Return ONLY a raw JSON object (no markdown, no backticks), with EXACTLY these keys: "
+    "rows (integer), columns (array of column-name strings), "
+    "mean, std, variance, min, max, median, mode, range, allowed_values, value_range "
+    "(each an object mapping column name to the stated value; empty object if not mentioned), "
+    "correlation (array; empty array if not mentioned).\n"
+    "RULES: Column names EXACTLY as in the transcript, in the ORIGINAL script (Korean stays in Hangul like 온도, never translated). "
+    "Every column mentioned must be in the columns array. Stat object keys use those same names. "
+    "Numbers as plain JSON numbers. Include only what the transcript states.\n\n"
+    "Transcript:\n"
+)
+
 async def handle(req: Req):
-    audio = re.sub(r"^data:audio/[\w.+-]+;base64,", "", req.audio_base64)
-    fmt = detect_format(audio)
-    payload = {
-        "model": "gpt-4o-audio-preview",
-        "temperature": 0,
-        "modalities": ["text"],
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_audio", "input_audio": {"data": audio, "format": fmt}},
-                    {"type": "text", "text": PROMPT},
-                ],
-            }
-        ],
-    }
-    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
+    b64 = re.sub(r"^data:audio/[\w.+-]+;base64,", "", req.audio_base64)
+    raw = base64.b64decode(b64)
+    ext = detect_ext(raw)
+    headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}"}
+
     async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(AIPIPE_URL, json=payload, headers=headers)
+        files = {"file": (f"audio.{ext}", raw, f"audio/{ext}")}
+        form = {"model": "whisper-1"}
+        tr = await client.post(WHISPER_URL, headers=headers, data=form, files=files)
+        try:
+            transcript = tr.json().get("text", "")
+        except Exception:
+            transcript = ""
+
+        payload = {
+            "model": "gpt-4o",
+            "temperature": 0,
+            "messages": [{"role": "user", "content": PARSE_PROMPT + transcript}],
+        }
+        r = await client.post(CHAT_URL, json=payload, headers={**headers, "Content-Type": "application/json"})
+
     data = r.json()
     try:
         text = data["choices"][0]["message"]["content"].strip()
@@ -87,10 +82,7 @@ async def handle(req: Req):
         result = json.loads(text)
     except Exception:
         m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            result = json.loads(m.group(0))
-        else:
-            result = {}
+        result = json.loads(m.group(0)) if m else {}
     defaults = {"rows": 0, "columns": [], "correlation": []}
     for k in REQUIRED_KEYS:
         if k not in result:
