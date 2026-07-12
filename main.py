@@ -1,4 +1,4 @@
-import os, re, json
+import os, re, json, base64
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,8 +22,8 @@ class Req(BaseModel):
     audio_base64: str
 
 PROMPT = (
-    "Listen to this audio very carefully. It may be spoken in ANY language "
-    "(English, Korean, Japanese, Hindi, etc.). It describes a dataset specification: "
+    "Listen to this audio very carefully, word by word. It may be spoken in ANY language "
+    "(English, Korean, Japanese, Hindi, Tamil, etc.). It describes a dataset specification: "
     "number of rows, one or more column names, and per-column statistics or rules. "
     "Return ONLY a raw JSON object (no markdown, no backticks), with EXACTLY these keys: "
     "rows (integer), columns (array of column-name strings), "
@@ -32,16 +32,34 @@ PROMPT = (
     "stated in the audio; use an empty object for any not mentioned), "
     "correlation (array; empty array if not mentioned). "
     "CRITICAL RULES: "
-    "1) Column names must be written EXACTLY as spoken, in the ORIGINAL language and script. "
-    "For example if the audio says a Korean word, write it in Korean characters. Do NOT translate to English. "
-    "2) Every column mentioned in the audio MUST appear in the columns array. "
-    "3) The keys inside mean, std, min, max and the other stat objects must be those same original-language column names. "
+    "1) Column names must be written EXACTLY as spoken, in the ORIGINAL language and script of the audio. "
+    "If the audio is Korean, write column names in Hangul (e.g. 온도). If Japanese, in Japanese script. Never translate to English. "
+    "2) The columns array must NEVER be empty - the audio always names at least one column. Listen again if needed. "
+    "3) The keys inside mean, std, min, max and the other stat objects must be those same original-script column names. "
     "4) Numbers must be plain JSON numbers exactly as spoken. "
     "5) Include only what the audio states."
 )
 
+def detect_format(b64):
+    try:
+        head = base64.b64decode(b64[:64] + "==")
+    except Exception:
+        return "wav"
+    if head[:4] == b"RIFF":
+        return "wav"
+    if head[:3] == b"ID3" or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if head[:4] == b"OggS":
+        return "ogg"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if len(head) > 8 and head[4:8] == b"ftyp":
+        return "mp4"
+    return "wav"
+
 async def handle(req: Req):
-    audio = re.sub(r"^data:audio/\w+;base64,", "", req.audio_base64)
+    audio = re.sub(r"^data:audio/[\w.+-]+;base64,", "", req.audio_base64)
+    fmt = detect_format(audio)
     payload = {
         "model": "gpt-4o-audio-preview",
         "temperature": 0,
@@ -50,7 +68,7 @@ async def handle(req: Req):
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_audio", "input_audio": {"data": audio, "format": "wav"}},
+                    {"type": "input_audio", "input_audio": {"data": audio, "format": fmt}},
                     {"type": "text", "text": PROMPT},
                 ],
             }
