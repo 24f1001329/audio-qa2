@@ -53,8 +53,9 @@ async def handle(req: Req):
     fmt = detect_format(raw)
     headers = {"Authorization": f"Bearer {AIPIPE_TOKEN}", "Content-Type": "application/json"}
 
+    debug = {}
+
     async with httpx.AsyncClient(timeout=120) as client:
-        # Step 1: transcribe with the audio model
         t_payload = {
             "model": "gpt-4o-audio-preview",
             "temperature": 0,
@@ -68,34 +69,44 @@ async def handle(req: Req):
             }],
         }
         tr = await client.post(CHAT_URL, json=t_payload, headers=headers)
+        debug["step1_status"] = tr.status_code
+        debug["step1_raw"] = tr.text[:800]
         try:
             transcript = tr.json()["choices"][0]["message"]["content"].strip()
-        except Exception:
+        except Exception as e:
             transcript = ""
+            debug["step1_error"] = str(e)
+        debug["transcript"] = transcript
 
-        # Step 2: parse the transcript into the required JSON
         p_payload = {
             "model": "gpt-4o",
             "temperature": 0,
             "messages": [{"role": "user", "content": PARSE_PROMPT + transcript}],
         }
         r = await client.post(CHAT_URL, json=p_payload, headers=headers)
+        debug["step2_status"] = r.status_code
+        debug["step2_raw"] = r.text[:800]
 
     data = r.json()
     try:
         text = data["choices"][0]["message"]["content"].strip()
-    except Exception:
+    except Exception as e:
         text = "{}"
+        debug["step2_error"] = str(e)
     text = text.replace("```json", "").replace("```", "").strip()
     try:
         result = json.loads(text)
-    except Exception:
+    except Exception as e:
+        debug["parse_error"] = str(e)
         m = re.search(r"\{.*\}", text, re.DOTALL)
         result = json.loads(m.group(0)) if m else {}
+
     defaults = {"rows": 0, "columns": [], "correlation": []}
     for k in REQUIRED_KEYS:
         if k not in result:
             result[k] = defaults.get(k, {})
+
+    result["_debug"] = debug
     return result
 
 @app.get("/")
